@@ -3,7 +3,7 @@ from __future__ import with_statement
 from datetime import datetime
 
 import importlib
-import django
+import pickle
 from django.contrib import admin
 from django.contrib.auth import get_permission_codename
 from django.utils import six
@@ -25,6 +25,7 @@ from django.utils.module_loading import import_string
 from django.utils.encoding import force_text
 from django.views.decorators.http import require_POST
 
+from .exceptions import AsyncExportError
 from .forms import (
     ImportForm,
     ConfirmImportForm,
@@ -49,7 +50,36 @@ if isinstance(TMP_STORAGE_CLASS, six.string_types):
     TMP_STORAGE_CLASS = import_string(TMP_STORAGE_CLASS)
 
 
+ASYNC_EXPORT_BACKEND = getattr(settings, 'IMPORT_EXPORT_ASYNC_EXPORT_BACKEND', None)
+ALLOW_ASYNC_EXPORT = getattr(settings, 'IMPORT_EXPORT_ALLOW_ASYNC_EXPORT', False)
+ASYNC_EXPORT_LEVEL = getattr(settings, 'IMPORT_EXPORT_ASYNC_EXPORT_LEVEL', 0)
+ASYNC_EXPORT_STORAGE_PATH = getattr(settings, 'IMPORT_EXPORT_STORAGE_PATH', "")
+
+
+def load_class_from_settings(SETTINGS_CLASS, settings_class_name):
+    try:
+        # Nod to tastypie's use of importlib.
+        parts = SETTINGS_CLASS.split('.')
+        module_path, class_name = '.'.join(parts[:-1]), parts[-1]
+        module = importlib.import_module(module_path)
+        SETTINGS_CLASS = getattr(module, class_name)
+        return SETTINGS_CLASS
+    except ImportError as e:
+        msg = (
+            "Could not import '%s' for import_export setting '%s'"
+        ) % (SETTINGS_CLASS, settings_class_name)
+        raise ImportError(msg)
+
+
+if isinstance(TMP_STORAGE_CLASS, six.string_types):
+    TMP_STORAGE_CLASS = load_class_from_settings(TMP_STORAGE_CLASS, 'IMPORT_EXPORT_TMP_STORAGE_CLASS')
+
+if isinstance(ASYNC_EXPORT_BACKEND, six.string_types):
+    ASYNC_EXPORT_BACKEND = load_class_from_settings(ASYNC_EXPORT_BACKEND, 'IMPORT_EXPORT_ASYNC_EXPORT_BACKEND')
+
+
 class ImportExportMixinBase(object):
+
     def get_model_info(self):
         # module_name is renamed to model_name in Django 1.8
         app_label = self.model._meta.app_label
@@ -426,6 +456,52 @@ class ExportMixin(ImportExportMixinBase):
     def get_context_data(self, **kwargs):
         return {}
 
+    def handle_export(self, file_format, queryset, *args, **kwargs):
+        request = kwargs.get("request")
+
+        if not ASYNC_EXPORT_BACKEND is None and ALLOW_ASYNC_EXPORT and queryset.count() > ASYNC_EXPORT_LEVEL:
+            if not ASYNC_EXPORT_STORAGE_PATH:
+                raise AsyncExportError(_('When exporting data asynchronously, you must specify a directory in which to save the exported data.'))
+            file_format_name = str(file_format.__name__)
+            model_name = self.get_model_info()[1]
+            model_name = model_name.capitalize()
+            subject_line = model_name + str(_(' Data Export'))
+
+            resource_class = self.get_export_resource_class()
+            resource_kwargs = self.get_export_resource_kwargs(request)
+            resource_class_import_path = '%s.%s' % (resource_class.__module__, resource_class.__name__)
+
+            export_backend = ASYNC_EXPORT_BACKEND()
+
+            result = export_backend.create_task(file_format_name, pickle.dumps(queryset.query), resource_class_import_path, resource_kwargs, request.user.id, subject_line)
+        else:
+            file_format_instance = file_format()
+            exported_data = self.get_export_data(file_format_instance, queryset, request=request)
+            content_type = file_format_instance.get_content_type()
+            result = HttpResponse(exported_data, content_type=content_type)
+            result['Content-Disposition'] = 'attachment; filename=%s' % (
+                self.get_export_filename(file_format_instance),
+            )
+
+        if isinstance(result, HttpResponse):
+            response = result
+        else:
+            response = self.process_export_result(request)
+
+        return response
+
+    def process_export_result(self, request):
+        self.add_successful_export_message(request)
+        post_export.send(sender=None, model=self.model)
+
+        url = reverse('admin:%s_%s_changelist' % self.get_model_info(),
+                      current_app=self.admin_site.name)
+        return HttpResponseRedirect(url)
+
+    def add_successful_export_message(self, request):
+        success_message = _("Data export in progress. When it's done, you will get an email with a url where you can download the results.")
+        messages.success(request, success_message)
+
     def export_action(self, request, *args, **kwargs):
         if not self.has_export_permission(request):
             raise PermissionDenied
@@ -435,15 +511,10 @@ class ExportMixin(ImportExportMixinBase):
         if form.is_valid():
             file_format = formats[
                 int(form.cleaned_data['file_format'])
-            ]()
+            ]
 
             queryset = self.get_export_queryset(request)
-            export_data = self.get_export_data(file_format, queryset, request=request)
-            content_type = file_format.get_content_type()
-            response = HttpResponse(export_data, content_type=content_type)
-            response['Content-Disposition'] = 'attachment; filename=%s' % (
-                self.get_export_filename(file_format),
-            )
+            response = self.handle_export(file_format, queryset, request=request)
 
             post_export.send(sender=None, model=self.model)
             return response
@@ -513,15 +584,11 @@ class ExportActionMixin(ExportMixin):
             messages.warning(request, _('You must select an export format.'))
         else:
             formats = self.get_export_formats()
-            file_format = formats[int(export_format)]()
+            file_format = formats[int(export_format)]
 
-            export_data = self.get_export_data(file_format, queryset, request=request)
-            content_type = file_format.get_content_type()
-            response = HttpResponse(export_data, content_type=content_type)
-            response['Content-Disposition'] = 'attachment; filename=%s' % (
-                self.get_export_filename(file_format),
-            )
+            response = self.handle_export(file_format, queryset, request=request)
             return response
+
     export_admin_action.short_description = _(
         'Export selected %(verbose_name_plural)s')
 
